@@ -16,6 +16,7 @@ from ISAT.widgets.about_dialog import AboutDialog
 from ISAT.widgets.converter_dialog import ConverterDialog
 from ISAT.widgets.auto_segment_dialog import AutoSegmentDialog
 from ISAT.widgets.model_manager_dialog import ModelManagerDialog
+from ISAT.widgets.annos_validator_dialog import AnnosValidatorDialog
 from ISAT.widgets.canvas import AnnotationScene, AnnotationView
 from ISAT.configs import STATUSMode, MAPMode, load_config, save_config, CONFIG_FILE, SOFTWARE_CONFIG_FILE, CHECKPOINT_PATH, ISAT_ROOT
 from ISAT.annotation import Object, Annotation
@@ -31,6 +32,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 import numpy as np
 import torch
 import cv2  # 调整图像饱和度
+import datetime
 
 class SegAnyThread(QThread):
     tag = pyqtSignal(int, int, str)
@@ -43,17 +45,35 @@ class SegAnyThread(QThread):
     @torch.no_grad()
     def sam_encoder(self, image):
         torch.cuda.empty_cache()
+        with torch.inference_mode(), torch.autocast(self.mainwindow.segany.device,
+                                                    dtype=self.mainwindow.segany.model_dtype):
 
-        input_image = self.mainwindow.segany.predictor_with_point_prompt.transform.apply_image(image)
-        input_image_torch = torch.as_tensor(input_image, device=self.mainwindow.segany.predictor_with_point_prompt.device)
-        input_image_torch = input_image_torch.permute(2, 0, 1).contiguous()[None, :, :, :]
+            # sam2 函数命名等发生很大改变，为了适应后续基于sam2的各类模型，这里分开处理sam1和sam2模型
+            if 'sam2' in self.mainwindow.segany.model_type:
+                _orig_hw = tuple([image.shape[:2]])
+                input_image = self.mainwindow.segany.predictor_with_point_prompt._transforms(image)
+                input_image = input_image[None, ...].to(self.mainwindow.segany.predictor_with_point_prompt.device)
+                backbone_out = self.mainwindow.segany.predictor_with_point_prompt.model.forward_image(input_image)
+                _, vision_feats, _, _ = self.mainwindow.segany.predictor_with_point_prompt.model._prepare_backbone_features(backbone_out)
+                if self.mainwindow.segany.predictor_with_point_prompt.model.directly_add_no_mem_embed:
+                    vision_feats[-1] = vision_feats[-1] + self.mainwindow.segany.predictor_with_point_prompt.model.no_mem_embed
+                feats = [
+                    feat.permute(1, 2, 0).view(1, -1, *feat_size)
+                    for feat, feat_size in zip(vision_feats[::-1], self.mainwindow.segany.predictor_with_point_prompt._bb_feat_sizes[::-1])
+                ][::-1]
+                _features = {"image_embed": feats[-1], "high_res_feats": tuple(feats[:-1])}
+                return _features, _orig_hw, _orig_hw
+            else:
+                input_image = self.mainwindow.segany.predictor_with_point_prompt.transform.apply_image(image)
+                input_image_torch = torch.as_tensor(input_image, device=self.mainwindow.segany.predictor_with_point_prompt.device)
+                input_image_torch = input_image_torch.permute(2, 0, 1).contiguous()[None, :, :, :]
 
-        original_size = image.shape[:2]
-        input_size = tuple(input_image_torch.shape[-2:])
+                original_size = image.shape[:2]
+                input_size = tuple(input_image_torch.shape[-2:])
 
-        input_image = self.mainwindow.segany.predictor_with_point_prompt.model.preprocess(input_image_torch)
-        features = self.mainwindow.segany.predictor_with_point_prompt.model.image_encoder(input_image)
-        return features, original_size, input_size
+                input_image = self.mainwindow.segany.predictor_with_point_prompt.model.preprocess(input_image_torch)
+                features = self.mainwindow.segany.predictor_with_point_prompt.model.image_encoder(input_image)
+                return features, original_size, input_size
 
     def run(self):
         if self.index is not None:
@@ -99,6 +119,26 @@ class SegAnyThread(QThread):
                 else:
                     self.tag.emit(index, 1, '')
 
+
+class InitSegAnyThread(QThread):
+    tag = pyqtSignal(bool)
+    def __init__(self, mainwindow):
+        super(InitSegAnyThread, self).__init__()
+        self.mainwindow = mainwindow
+        self.model_path:str = None
+
+    def run(self):
+        if self.model_path is not None:
+            try:
+                self.mainwindow.segany = SegAny(self.model_path, self.mainwindow.cfg['software']['use_bfloat16'])
+                self.tag.emit(True)
+            except Exception as e:
+                print(e)
+                self.tag.emit(False)
+        else:
+            self.tag.emit(False)
+
+
 class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     def __init__(self):
         super(MainWindow, self).__init__()
@@ -118,6 +158,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.software_config_file = SOFTWARE_CONFIG_FILE
 
         self.saved = True
+        self.auto_save_anns = False
+
         self.can_be_annotated = True
         self.load_finished = False
         self.polygons:list = []
@@ -132,24 +174,41 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         # 新增 手动/自动 group选择
         self.group_select_mode = 'auto'
-        
         self.init_ui()
         self.reload_cfg()
 
         self.init_connect()
         self.reset_action()
 
+        # sam初始化线程，大模型加载较慢
+        self.init_segany_thread = InitSegAnyThread(self)
+        self.init_segany_thread.tag.connect(self.init_sam_finish)
+
+    def toggle_auto_save(self, checked):
+        self.auto_save_anns = checked
+        self.cfg['software']['auto_save'] = self.auto_save_anns
+        self.save_software_cfg()
+
     def init_segment_anything(self, model_name=None):
+        if not self.saved:
+            result = QtWidgets.QMessageBox.question(self, 'Warning', 'Proceed without saved?', QtWidgets.QMessageBox.StandardButton.Yes|QtWidgets.QMessageBox.StandardButton.No, QtWidgets.QMessageBox.StandardButton.No)
+            if result == QtWidgets.QMessageBox.StandardButton.No:
+                if isinstance(self.sender(), QtWidgets.QAction):
+                    self.sender().setChecked(False)
+                return
         if model_name is None:
             if self.use_segment_anything:
                 model_name = os.path.split(self.segany.checkpoint)[-1]
             else:
                 return
         # 等待sam线程完成
+        self.actionSegment_anything.setEnabled(False)
         try:
             self.seganythread.wait()
             self.seganythread.results_dict.clear()
-        except: pass
+        except:
+            if isinstance(self.sender(), QtWidgets.QAction):
+                self.sender().setChecked(False)
 
         if model_name == '':
             self.use_segment_anything = False
@@ -165,37 +224,48 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 action.setChecked(model_name == name)
             self.use_segment_anything = False
             return
-        try:
-            self.segany = SegAny(model_path, self.cfg['software']['use_bfloat16'])
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(
-                self,
-                'Load model error',
-                'Error {}, when load sam model: {}'.format(e, model_path)
-            )
-            self.use_segment_anything = False
-            return
-        self.use_segment_anything = True
-        self.statusbar.showMessage('Use the checkpoint named {}.'.format(model_name), 3000)
-        for name, action in self.pths_actions.items():
-            action.setChecked(model_name==name)
-        if self.use_segment_anything:
-            if self.segany.device != 'cpu':
-                if self.gpu_resource_thread is None:
-                    self.gpu_resource_thread = GPUResource_Thread()
-                    self.gpu_resource_thread.message.connect(self.labelGPUResource.setText)
-                    self.gpu_resource_thread.start()
+
+        self.init_segany_thread.model_path = model_path
+        self.init_segany_thread.start()
+        self.setEnabled(False)
+
+    def init_sam_finish(self, tag:bool):
+        self.setEnabled(True)
+        if tag:
+            self.use_segment_anything = True
+            if self.use_segment_anything:
+                if self.segany.device != 'cpu':
+                    if self.gpu_resource_thread is None:
+                        self.gpu_resource_thread = GPUResource_Thread()
+                        self.gpu_resource_thread.message.connect(self.labelGPUResource.setText)
+                        self.gpu_resource_thread.start()
+                else:
+                    self.labelGPUResource.setText('cpu')
             else:
-                self.labelGPUResource.setText('cpu')
+                self.labelGPUResource.setText('segment anything unused.')
+            tooltip = 'model: {}'.format(os.path.split(self.segany.checkpoint)[-1])
+            tooltip += '\ndtype: {}'.format(self.segany.model_dtype)
+            tooltip += '\ntorch: {}'.format(torch.__version__)
+            if self.segany.device == 'cuda':
+                try:
+                    tooltip += '\ncuda : {}'.format(torch.version.cuda)
+                except: pass
+            self.labelGPUResource.setToolTip(tooltip)
+
+            self.seganythread = SegAnyThread(self)
+            self.seganythread.tag.connect(self.sam_encoder_finish)
+            self.seganythread.start()
+
+            if self.current_index is not None:
+                self.show_image(self.current_index)
+
+            checkpoint_name = os.path.split(self.segany.checkpoint)[-1]
+            self.statusbar.showMessage('Use the checkpoint named {}.'.format(checkpoint_name), 3000)
         else:
-            self.labelGPUResource.setText('segment anything unused.')
+            self.use_segment_anything = False
 
-        self.seganythread = SegAnyThread(self)
-        self.seganythread.tag.connect(self.sam_encoder_finish)
-        self.seganythread.start()
-
-        if self.current_index is not None:
-            self.show_image(self.current_index)
+        for name, action in self.pths_actions.items():
+            action.setChecked(tag and checkpoint_name == name)
 
     def sam_encoder_finish(self, index:int, state:int, message:str):
         if state == 1:  # 识别完
@@ -252,6 +322,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.segany.predictor_with_point_prompt.original_size = original_size
             self.segany.predictor_with_point_prompt.input_size = input_size
             self.segany.predictor_with_point_prompt.is_image_set = True
+            # sam2
+            self.segany.predictor_with_point_prompt._orig_hw = list(original_size)
+            self.segany.predictor_with_point_prompt._features = features
+            self.segany.predictor_with_point_prompt._is_image_set = True
+
             self.actionSegment_anything.setEnabled(True)
         else:
             self.segany.predictor_with_point_prompt.reset_image()
@@ -283,13 +358,24 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # 新增手动/自动 选择group
         self.next_group_shortcut.activated.connect(self.annos_dock_widget.go_to_next_group)
         self.prev_group_shortcut.activated.connect(self.annos_dock_widget.go_to_prev_group)           
-               
+
         self.scene = AnnotationScene(mainwindow=self)
         self.category_choice_widget = CategoryChoiceDialog(self, mainwindow=self, scene=self.scene)
         self.category_edit_widget = CategoryEditDialog(self, self, self.scene)
 
+        # 批量点修改 (issue 160) 快捷键
+        self.polygon_repaint_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("R"), self)
+        self.polygon_repaint_shortcut.activated.connect(self.scene.change_mode_to_repaint)
+
+        # 新增图片保存功能，快捷键。P保存场景(只图片区域)，Ctrl+P保存整个窗口
+        self.scene_shot_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("P"), self)
+        self.scene_shot_shortcut.activated.connect(functools.partial(self.screen_shot, 'scene'))
+        self.window_shot_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+P"), self)
+        self.window_shot_shortcut.activated.connect(functools.partial(self.screen_shot, 'window'))
+
         self.Converter_dialog = ConverterDialog(self, mainwindow=self)
         self.auto_segment_dialog = AutoSegmentDialog(self, self)
+        self.annos_validator_dialog = AnnosValidatorDialog(self, self)
 
         self.view = AnnotationView(parent=self)
         self.view.setScene(self.scene)
@@ -297,8 +383,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         self.right_button_menu = RightButtonMenu(mainwindow=self)
         self.right_button_menu.addAction(self.actionEdit)
+        self.right_button_menu.addAction(self.actionCopy)
         self.right_button_menu.addAction(self.actionTo_top)
         self.right_button_menu.addAction(self.actionTo_bottom)
+        self.right_button_menu.addAction(self.actionDelete)
 
         self.shortcut_dialog = ShortcutDialog(self)
         self.about_dialog = AboutDialog(self)
@@ -318,6 +406,17 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.labelData.setFixedWidth(150)
         self.statusbar.addPermanentWidget(self.labelData)
 
+        # mode显示, view, create, edit, repaint
+        self.modeState = QtWidgets.QLabel('V')
+        self.modeState.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.modeState.setFixedWidth(50)
+        self.modeState.setStyleSheet("""
+            background-color: #70AEFF;
+            border-radius : 5px; 
+            color: white;
+        """)
+        self.statusbar.addPermanentWidget(self.modeState)
+
         self.update_menuSAM()
 
         # mask alpha
@@ -327,7 +426,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.mask_aplha.setStatusTip('Mask alpha.')
         self.mask_aplha.setToolTip('Mask alpha')
         self.mask_aplha.setMaximum(10)
-        self.mask_aplha.setMinimum(3)
+        self.mask_aplha.setMinimum(0)
+        self.mask_aplha.setPageStep(1)
         self.mask_aplha.valueChanged.connect(self.change_mask_aplha)
         self.toolBar.addWidget(self.mask_aplha)
 
@@ -337,8 +437,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.vertex_size.setFixedWidth(50)
         self.vertex_size.setStatusTip('Vertex size.')
         self.vertex_size.setToolTip('Vertex size')
-        self.vertex_size.setMaximum(10)
-        self.vertex_size.setMinimum(2)
+        self.vertex_size.setMaximum(5)
+        self.vertex_size.setPageStep(1)
         self.vertex_size.valueChanged.connect(self.change_vertex_size)
         self.toolBar.addWidget(self.vertex_size)
 
@@ -350,6 +450,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.image_saturation.setToolTip('Image saturation')
         self.image_saturation.setMaximum(500)
         self.image_saturation.setMinimum(0)
+        self.image_saturation.setPageStep(10)
         self.image_saturation.setTickInterval(10)
         self.image_saturation.valueChanged.connect(self.change_saturation)
         self.toolBar.addWidget(self.image_saturation)
@@ -416,12 +517,34 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.files_dock_widget.retranslateUi(self.files_dock_widget)
         self.category_choice_widget.retranslateUi(self.category_choice_widget)
         self.category_edit_widget.retranslateUi(self.category_edit_widget)
+        self.categories_dock_widget.retranslateUi(self.categories_dock_widget)
         self.setting_dialog.retranslateUi(self.setting_dialog)
         self.model_manager_dialog.retranslateUi(self.model_manager_dialog)
         self.about_dialog.retranslateUi(self.about_dialog)
         self.shortcut_dialog.retranslateUi(self.shortcut_dialog)
         self.Converter_dialog.retranslateUi(self.Converter_dialog)
         self.auto_segment_dialog.retranslateUi(self.auto_segment_dialog)
+        self.annos_validator_dialog.retranslateUi(self.annos_validator_dialog)
+
+        # 手动添加翻译 ------
+        _translate = QtCore.QCoreApplication.translate
+        self.mask_aplha.setStatusTip(_translate("MainWindow", "Mask alpha."))
+        self.mask_aplha.setToolTip(_translate("MainWindow", "Mask alpha"))
+        self.vertex_size.setStatusTip(_translate("MainWindow", "Vertex size."))
+        self.vertex_size.setToolTip(_translate("MainWindow", "Vertex size"))
+        self.image_saturation.setStatusTip(_translate("MainWindow", "Image saturation."))
+        self.image_saturation.setToolTip(_translate("MainWindow", "Image saturation"))
+        self.show_prompt.setStatusTip(_translate("MainWindow", "Show prompt."))
+        self.show_prompt.setToolTip(_translate("MainWindow", "Show prompt"))
+        self.show_edge.setStatusTip(_translate("MainWindow", "Show edge."))
+        self.show_edge.setToolTip(_translate("MainWindow", "Show edge"))
+        self.use_polydp.setStatusTip(_translate("MainWindow", "approx polygon."))
+        self.use_polydp.setToolTip(_translate("MainWindow", "approx polygon"))
+
+        self.categories_dock_widget.pushButton_group_mode.setStatusTip(_translate("MainWindow", "Group id auto add 1 when add a new polygon."))
+        self.modeState.setStatusTip(_translate('MainWindow', 'View mode.'))
+
+        # -----------------
 
     def translate_to_chinese(self):
         self.translate('zh')
@@ -445,6 +568,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.cfg['software']['language'] = language
         self.translate(language)
 
+        self.auto_save_anns = software_cfg.get('auto_save', False)
+        self.cfg['software']['auto_save'] = self.auto_save_anns
+        self.actionAutoSave.setChecked(self.auto_save_anns)
+
         contour_mode = software_cfg.get('contour_mode', 'max_only')
         self.cfg['software']['contour_mode'] = contour_mode
         self.change_contour_mode(contour_mode)
@@ -453,7 +580,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.cfg['software']['mask_alpha'] = mask_alpha
         self.mask_aplha.setValue(int(mask_alpha*10))
 
-        vertex_size = software_cfg.get('vertex_size', 2)
+        vertex_size = software_cfg.get('vertex_size', 1)
         self.cfg['software']['vertex_size'] = int(vertex_size)
         self.vertex_size.setValue(vertex_size)
 
@@ -492,6 +619,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.show_image(self.current_index)
 
     def set_saved_state(self, is_saved:bool):
+        if not is_saved:
+            if self.auto_save_anns:
+                self.save()
+                is_saved = True
         self.saved = is_saved
         if self.files_list is not None and self.current_index is not None:
 
@@ -571,10 +702,13 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     def update_group_display(self):
         self.categories_dock_widget.lineEdit_currentGroup.setText(str(self.current_group))
 
-    def show_image(self, index:int):
+    def show_image(self, index:int, zoomfit:bool=True):
         self.reset_action()
+        self.scene.cancel_draw()
+        self.scene.unload_image()
+        self.annos_dock_widget.listWidget.clear()
         self.change_bit_map_to_label()
-        # 
+        #
         self.files_dock_widget.label_prev_state.setStyleSheet("background-color: {};".format('#999999'))
         self.files_dock_widget.label_current_state.setStyleSheet("background-color: {};".format('#999999'))
         self.files_dock_widget.label_next_state.setStyleSheet("background-color: {};".format('#999999'))
@@ -583,13 +717,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.load_finished = False
         self.saved = True
         if not -1 < index < len(self.files_list):
-            self.scene.clear()
-            self.scene.setSceneRect(QtCore.QRectF())
             return
         try:
-            self.polygons.clear()
-            self.annos_dock_widget.listWidget.clear()
-            self.scene.cancel_draw()
             file_path = os.path.join(self.image_root, self.files_list[index])
             image_data = Image.open(file_path)
 
@@ -597,7 +726,6 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             if self.png_palette is not None and file_path.endswith('.png'):
                 self.statusbar.showMessage('This is a label file.')
                 self.can_be_annotated = False
-
             else:
                 self.can_be_annotated = True
 
@@ -625,8 +753,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                 self.seganythread.index = index
                 self.seganythread.start()
                 self.SeganyEnabled()
-
-            self.view.zoomfit()
+            if zoomfit:
+                self.view.zoomfit()
 
             # load label
             if self.can_be_annotated:
@@ -871,21 +999,21 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.cfg['software']['vertex_size'] = value
         self.save_software_cfg()
         if self.current_index is not None:
-            self.show_image(self.current_index)
+            self.show_image(self.current_index, zoomfit=False)
 
     def change_edge_state(self):
         visible = self.show_edge.checked
         self.cfg['software']['show_edge'] = visible
         self.save_software_cfg()
         if self.current_index is not None:
-            self.show_image(self.current_index)
+            self.show_image(self.current_index, zoomfit=False)
 
     def change_approx_polygon_state(self):  # 是否使用多边形拟合，来减少多边形顶点
         checked = self.use_polydp.checked
         self.cfg['software']['use_polydp'] = checked
         self.save_software_cfg()
         if self.current_index is not None:
-            self.show_image(self.current_index)
+            self.show_image(self.current_index, zoomfit=False)
 
     def change_saturation(self, value):  # 调整图像饱和度
         if self.scene.image_data is not None:
@@ -916,13 +1044,46 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         if self.use_segment_anything:
             self.auto_segment_dialog.show()
         else:
-            QtWidgets.QMessageBox.warning(self, 'Warning', 'Choice a sam model before auto segment.')
+            QtWidgets.QMessageBox.warning(self, 'Warning', 'Select a sam model before auto segment.')
+
+    def annos_validator(self):
+        self.annos_validator_dialog.show()
 
     def help(self):
         self.shortcut_dialog.show()
 
     def about(self):
         self.about_dialog.show()
+
+    def screen_shot(self, type='scene'):
+        image_name = "ISAT-{}-{}.png".format(type, datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+        save_path = os.path.join(os.getcwd(), image_name)
+
+        if type == 'scene':
+            try:
+                self.scene.guide_line_x.setVisible(False)
+                self.scene.guide_line_y.setVisible(False)
+            except: pass
+            image = QtGui.QImage(self.scene.sceneRect().size().toSize(), QtGui.QImage.Format_ARGB32)
+            painter = QtGui.QPainter(image)
+            self.scene.render(painter)
+            painter.end()
+            image.save(save_path)
+            self.statusbar.showMessage('Save scene screenshot to {}'.format(save_path), 3000)
+            try:
+                self.scene.guide_line_x.setVisible(True)
+                self.scene.guide_line_y.setVisible(True)
+            except: pass
+        elif type == 'window':
+            image = QtGui.QImage(self.size(), QtGui.QImage.Format_ARGB32)
+            painter = QtGui.QPainter(image)
+            self.render(painter)
+            painter.end()
+            image.save(save_path)
+            self.statusbar.showMessage('Save window screenshot to {}'.format(save_path), 3000)
+
+        else:
+            return
 
     def save_cfg(self, config_file):
         # 只保存类别配置
@@ -958,8 +1119,14 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.actionEdit.triggered.connect(self.scene.edit_polygon)
         self.actionDelete.triggered.connect(self.scene.delete_selected_graph)
         self.actionSave.triggered.connect(self.save)
+        self.actionAutoSave.toggled.connect(self.toggle_auto_save)
         self.actionTo_top.triggered.connect(self.scene.move_polygon_to_top)
         self.actionTo_bottom.triggered.connect(self.scene.move_polygon_to_bottom)
+        self.actionCopy.triggered.connect(self.scene.copy_item)
+        self.actionUnion.triggered.connect(self.scene.polygons_union)
+        self.actionSubtract.triggered.connect(self.scene.polygons_difference)
+        self.actionIntersect.triggered.connect(self.scene.polygons_intersection)
+        self.actionExclude.triggered.connect(self.scene.polygons_symmetric_difference)
 
         self.actionZoom_in.triggered.connect(self.view.zoom_in)
         self.actionZoom_out.triggered.connect(self.view.zoom_out)
@@ -976,6 +1143,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         self.actionConverter.triggered.connect(self.converter)
         self.actionAuto_segment.triggered.connect(self.auto_segment)
+        self.actionAnno_validator.triggered.connect(self.annos_validator)
 
         self.actionShortcut.triggered.connect(self.help)
         self.actionAbout.triggered.connect(self.about)
@@ -997,3 +1165,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.actionTo_bottom.setEnabled(False)
         self.actionBit_map.setChecked(False)
         self.actionBit_map.setEnabled(False)
+        self.actionCopy.setEnabled(False)
+        self.actionUnion.setEnabled(False)
+        self.actionSubtract.setEnabled(False)
+        self.actionIntersect.setEnabled(False)
+        self.actionExclude.setEnabled(False)

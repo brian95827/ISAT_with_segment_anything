@@ -20,9 +20,6 @@ class AnnosDockWidget(QtWidgets.QWidget, Ui_Form):
         self.comboBox_group_select.currentIndexChanged.connect(self.set_group_polygon_visible)
         self.button_next_group.clicked.connect(self.go_to_next_group)
         self.button_prev_group.clicked.connect(self.go_to_prev_group)
-        self.comboBox_group_select.setStatusTip('Select polygons by group.')
-        self.button_prev_group.setStatusTip('Prev group.')
-        self.button_next_group.setStatusTip('Next group.')
 
         self.listWidget.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.listWidget.customContextMenuRequested.connect(
@@ -110,15 +107,24 @@ class AnnosDockWidget(QtWidgets.QWidget, Ui_Form):
         have_selected = True if items else False
         if have_selected:
             self.mainwindow.scene.change_mode_to_edit()
+
+            if len(self.mainwindow.scene.selected_polygons_list) != 2 or len(self.listWidget.selectedItems()) != 2:
+                self.mainwindow.actionUnion.setEnabled(False)
+                self.mainwindow.actionSubtract.setEnabled(False)
+                self.mainwindow.actionIntersect.setEnabled(False)
+                self.mainwindow.actionExclude.setEnabled(False)
             # 编辑，置顶等功能只针对单个多边形
             if len(items) > 1:
                 self.mainwindow.actionTo_top.setEnabled(False)
                 self.mainwindow.actionTo_bottom.setEnabled(False)
                 self.mainwindow.actionEdit.setEnabled(False)
+                self.mainwindow.actionCopy.setEnabled(False)
         else:
             self.mainwindow.scene.change_mode_to_view()
 
         for index, polygon in enumerate(self.mainwindow.polygons):
+            if polygon not in self.polygon_item_dict:
+                continue
             if self.polygon_item_dict[polygon] in items:
                 if not polygon.isSelected():
                     polygon.setSelected(True)
@@ -153,7 +159,6 @@ class AnnosDockWidget(QtWidgets.QWidget, Ui_Form):
             else:
                 check_box.setChecked(False)
 
-
     def zoom_to_group(self):
         selected_group = self.comboBox_group_select.currentText()
         if selected_group == '':
@@ -180,28 +185,36 @@ class AnnosDockWidget(QtWidgets.QWidget, Ui_Form):
             self.comboBox_group_select.setCurrentIndex(current_index + 1)
             self.set_group_polygon_visible()
             self.zoom_to_group()
+
         if self.mainwindow.group_select_mode == 'track':
             try:
-                group = int(self.comboBox_group_select.currentText())
-                self.mainwindow.current_group = group
-                self.mainwindow.update_group_display()
+                if self.comboBox_group_select.currentText() == "All":
+                    max_group = self.comboBox_group_select.itemText(len(self.comboBox_group_select) - 1)
+                    self.mainwindow.current_group = max_group
+                    self.mainwindow.update_group_display()
+                else:
+                    group = int(self.comboBox_group_select.currentText())
+                    self.mainwindow.current_group = group
+                    self.mainwindow.update_group_display()
             except:
                 pass
-            
+
     def go_to_prev_group(self):
         current_index = self.comboBox_group_select.currentIndex()
         if current_index > 0:
             self.comboBox_group_select.setCurrentIndex(current_index - 1)
             self.set_group_polygon_visible()
             self.zoom_to_group()
+
         if self.mainwindow.group_select_mode == 'track':
             try:
-                group = int(self.comboBox_group_select.currentText())
-                self.mainwindow.current_group = group
-                self.mainwindow.update_group_display()
+                if self.comboBox_group_select.currentText() == "All":
+                    max_group = self.comboBox_group_select.itemText(len(self.comboBox_group_select) - 1)
+                    self.mainwindow.current_group = max_group
+                    self.mainwindow.update_group_display()
+                else:
+                    group = int(self.comboBox_group_select.currentText())
+                    self.mainwindow.current_group = group
+                    self.mainwindow.update_group_display()
             except:
                 pass
-            
-
-
-

@@ -26,8 +26,8 @@
    <string>ISAT</string>
   </property>
   <property name="windowIcon">
-   <iconset>
-    <normaloff>:/icons/icons/isat_bg_50x25.png</normaloff>:/icons/icons/isat_bg_50x25.png</iconset>
+   <iconset resource="../icons.qrc">
+    <normaloff>:/icon/icons/ISAT13_100.svg</normaloff>:/icon/icons/ISAT13_100.svg</iconset>
   </property>
   <widget class="QWidget" name="centralwidget">
    <layout class="QVBoxLayout" name="verticalLayout">
@@ -57,7 +57,7 @@
      <x>0</x>
      <y>0</y>
      <width>1280</width>
-     <height>24</height>
+     <height>25</height>
     </rect>
    </property>
    <property name="font">
@@ -153,6 +153,7 @@
     <addaction name="separator"/>
     <addaction name="actionConverter"/>
     <addaction name="actionAuto_segment"/>
+    <addaction name="actionAnno_validator"/>
    </widget>
    <widget class="QMenu" name="menuEdit">
     <property name="font">
@@ -170,12 +171,19 @@
     <addaction name="actionFinish"/>
     <addaction name="actionCancel"/>
     <addaction name="separator"/>
-    <addaction name="actionTo_top"/>
-    <addaction name="actionTo_bottom"/>
-    <addaction name="separator"/>
     <addaction name="actionEdit"/>
     <addaction name="actionDelete"/>
     <addaction name="actionSave"/>
+    <addaction name="actionAutoSave"/>
+    <addaction name="actionCopy"/>
+    <addaction name="separator"/>
+    <addaction name="actionTo_top"/>
+    <addaction name="actionTo_bottom"/>
+    <addaction name="separator"/>
+    <addaction name="actionUnion"/>
+    <addaction name="actionSubtract"/>
+    <addaction name="actionIntersect"/>
+    <addaction name="actionExclude"/>
    </widget>
    <widget class="QMenu" name="menuMode">
     <property name="font">
@@ -258,11 +266,18 @@
    <addaction name="actionFinish"/>
    <addaction name="actionCancel"/>
    <addaction name="separator"/>
+   <addaction name="actionEdit"/>
+   <addaction name="actionCopy"/>
+   <addaction name="actionSave"/>
+   <addaction name="actionDelete"/>
+   <addaction name="separator"/>
    <addaction name="actionTo_top"/>
    <addaction name="actionTo_bottom"/>
-   <addaction name="actionEdit"/>
-   <addaction name="actionDelete"/>
-   <addaction name="actionSave"/>
+   <addaction name="separator"/>
+   <addaction name="actionUnion"/>
+   <addaction name="actionSubtract"/>
+   <addaction name="actionIntersect"/>
+   <addaction name="actionExclude"/>
    <addaction name="separator"/>
    <addaction name="actionZoom_in"/>
    <addaction name="actionZoom_out"/>
@@ -829,6 +844,86 @@
    </property>
    <property name="text">
     <string>Auto segment with bounding box</string>
+   </property>
+  </action>
+  <action name="actionAnno_validator">
+   <property name="icon">
+    <iconset resource="../icons.qrc">
+     <normaloff>:/icon/icons/检查_inspection.svg</normaloff>:/icon/icons/检查_inspection.svg</iconset>
+   </property>
+   <property name="text">
+    <string>Annos validator</string>
+   </property>
+  </action>
+  <action name="actionCopy">
+   <property name="icon">
+    <iconset resource="../icons.qrc">
+     <normaloff>:/icon/icons/复制_copy.svg</normaloff>:/icon/icons/复制_copy.svg</iconset>
+   </property>
+   <property name="text">
+    <string>Copy</string>
+   </property>
+   <property name="shortcut">
+    <string>Ctrl+C</string>
+   </property>
+  </action>
+  <action name="actionUnion">
+   <property name="icon">
+    <iconset resource="../icons.qrc">
+     <normaloff>:/icon/icons/合并选择_union-selection.svg</normaloff>:/icon/icons/合并选择_union-selection.svg</iconset>
+   </property>
+   <property name="text">
+    <string>Union</string>
+   </property>
+   <property name="shortcut">
+    <string>Ctrl+A</string>
+   </property>
+  </action>
+  <action name="actionSubtract">
+   <property name="icon">
+    <iconset resource="../icons.qrc">
+     <normaloff>:/icon/icons/减去上一层_subtract-selection-one.svg</normaloff>:/icon/icons/减去上一层_subtract-selection-one.svg</iconset>
+   </property>
+   <property name="text">
+    <string>Subtract</string>
+   </property>
+   <property name="shortcut">
+    <string>Ctrl+D</string>
+   </property>
+  </action>
+  <action name="actionIntersect">
+   <property name="icon">
+    <iconset resource="../icons.qrc">
+     <normaloff>:/icon/icons/相交选择_intersect-selection.svg</normaloff>:/icon/icons/相交选择_intersect-selection.svg</iconset>
+   </property>
+   <property name="text">
+    <string>Intersect</string>
+   </property>
+   <property name="shortcut">
+    <string>Ctrl+Q</string>
+   </property>
+  </action>
+  <action name="actionExclude">
+   <property name="icon">
+    <iconset resource="../icons.qrc">
+     <normaloff>:/icon/icons/排除选择_exclude-selection.svg</normaloff>:/icon/icons/排除选择_exclude-selection.svg</iconset>
+   </property>
+   <property name="text">
+    <string>Exclude</string>
+   </property>
+   <property name="shortcut">
+    <string>Ctrl+E</string>
+   </property>
+  </action>
+  <action name="actionAutoSave">
+   <property name="checkable">
+    <bool>true</bool>
+   </property>
+   <property name="checked">
+    <bool>false</bool>
+   </property>
+   <property name="text">
+    <string>Auto save</string>
    </property>
   </action>
  </widget>
